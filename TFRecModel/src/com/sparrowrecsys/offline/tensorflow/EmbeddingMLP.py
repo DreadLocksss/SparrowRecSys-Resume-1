@@ -1,80 +1,115 @@
 import tensorflow as tf
+from pathlib import Path
 
 # Training samples path, change to your local path
-training_samples_file_path = tf.keras.utils.get_file("trainingSamples.csv",
-                                                     "file:///Users/zhewang/Workspace/SparrowRecSys/src/main"
-                                                     "/resources/webroot/sampledata/trainingSamples.csv")
+training_samples_origin = Path(
+    r"C:\Users\32116\Desktop\ut\algo\resume\1\SparrowRecSys-Resume-1\src\main\resources\webroot\sampledata\trainingSamples.csv"
+).as_uri()
+training_samples_file_path = tf.keras.utils.get_file(
+    "trainingSamples.csv", training_samples_origin
+)
+
 # Test samples path, change to your local path
-test_samples_file_path = tf.keras.utils.get_file("testSamples.csv",
-                                                 "file:///Users/zhewang/Workspace/SparrowRecSys/src/main"
-                                                 "/resources/webroot/sampledata/testSamples.csv")
+test_samples_origin = Path(
+    r"C:\Users\32116\Desktop\ut\algo\resume\1\SparrowRecSys-Resume-1\src\main\resources\webroot\sampledata\testSamples.csv"
+).as_uri()
+test_samples_file_path = tf.keras.utils.get_file(
+    "testSamples.csv", test_samples_origin
+)
 
 
 # load sample as tf dataset
-def get_dataset(file_path):
+def get_dataset(file_path, shuffle=True):
     dataset = tf.data.experimental.make_csv_dataset(
         file_path,
         batch_size=12,
         label_name='label',
         na_value="0",
         num_epochs=1,
+        shuffle=shuffle,
         ignore_errors=True)
     return dataset
 
 
 # split as test dataset and training dataset
-train_dataset = get_dataset(training_samples_file_path)
-test_dataset = get_dataset(test_samples_file_path)
+train_dataset = get_dataset(training_samples_file_path, shuffle=True)
+test_dataset = get_dataset(test_samples_file_path, shuffle=False)
 
 # genre features vocabulary
 genre_vocab = ['Film-Noir', 'Action', 'Adventure', 'Horror', 'Romance', 'War', 'Comedy', 'Western', 'Documentary',
                'Sci-Fi', 'Drama', 'Thriller',
                'Crime', 'Fantasy', 'Animation', 'IMAX', 'Mystery', 'Children', 'Musical']
 
-GENRE_FEATURES = {
-    'userGenre1': genre_vocab,
-    'userGenre2': genre_vocab,
-    'userGenre3': genre_vocab,
-    'userGenre4': genre_vocab,
-    'userGenre5': genre_vocab,
-    'movieGenre1': genre_vocab,
-    'movieGenre2': genre_vocab,
-    'movieGenre3': genre_vocab
-}
+GENRE_FEATURES = [
+    'userGenre1',
+    'userGenre2',
+    'userGenre3',
+    'userGenre4',
+    'userGenre5',
+    'movieGenre1',
+    'movieGenre2',
+    'movieGenre3'
+]
 
-# all categorical features
-categorical_columns = []
-for feature, vocab in GENRE_FEATURES.items():
-    cat_col = tf.feature_column.categorical_column_with_vocabulary_list(
-        key=feature, vocabulary_list=vocab)
-    emb_col = tf.feature_column.embedding_column(cat_col, 10)
-    categorical_columns.append(emb_col)
-# movie id embedding feature
-movie_col = tf.feature_column.categorical_column_with_identity(key='movieId', num_buckets=1001)
-movie_emb_col = tf.feature_column.embedding_column(movie_col, 10)
-categorical_columns.append(movie_emb_col)
+NUMERIC_FEATURES = [
+    'releaseYear',
+    'movieRatingCount',
+    'movieAvgRating',
+    'movieRatingStddev',
+    'userRatingCount',
+    'userAvgRating',
+    'userRatingStddev'
+]
 
-# user id embedding feature
-user_col = tf.feature_column.categorical_column_with_identity(key='userId', num_buckets=30001)
-user_emb_col = tf.feature_column.embedding_column(user_col, 10)
-categorical_columns.append(user_emb_col)
+ALL_MODEL_FEATURES = GENRE_FEATURES + ['movieId', 'userId'] + NUMERIC_FEATURES
 
-# all numerical features
-numerical_columns = [tf.feature_column.numeric_column('releaseYear'),
-                     tf.feature_column.numeric_column('movieRatingCount'),
-                     tf.feature_column.numeric_column('movieAvgRating'),
-                     tf.feature_column.numeric_column('movieRatingStddev'),
-                     tf.feature_column.numeric_column('userRatingCount'),
-                     tf.feature_column.numeric_column('userAvgRating'),
-                     tf.feature_column.numeric_column('userRatingStddev')]
 
-# embedding + MLP model architecture
-model = tf.keras.Sequential([
-    tf.keras.layers.DenseFeatures(numerical_columns + categorical_columns),
-    tf.keras.layers.Dense(256, activation='relu'),
-    tf.keras.layers.Dense(256, activation='relu'),
-    tf.keras.layers.Dense(1, activation='sigmoid'),
-])
+def select_model_features(features, label):
+    selected = {name: features[name] for name in ALL_MODEL_FEATURES}
+    return selected, tf.cast(label, tf.float32)
+
+
+train_dataset = train_dataset.map(select_model_features)
+test_dataset = test_dataset.map(select_model_features)
+
+# Keras 3 compatible model architecture
+inputs = {}
+for feature in GENRE_FEATURES:
+    inputs[feature] = tf.keras.Input(shape=(1,), name=feature, dtype=tf.string)
+
+inputs['movieId'] = tf.keras.Input(shape=(1,), name='movieId', dtype=tf.int64)
+inputs['userId'] = tf.keras.Input(shape=(1,), name='userId', dtype=tf.int64)
+
+for feature in NUMERIC_FEATURES:
+    inputs[feature] = tf.keras.Input(shape=(1,), name=feature, dtype=tf.float32)
+
+genre_lookup = tf.keras.layers.StringLookup(
+    vocabulary=genre_vocab,
+    mask_token=None,
+    num_oov_indices=1
+)
+genre_embedding_layer = tf.keras.layers.Embedding(
+    input_dim=genre_lookup.vocabulary_size(),
+    output_dim=10
+)
+
+genre_embeddings = []
+for feature in GENRE_FEATURES:
+    genre_ids = genre_lookup(inputs[feature])
+    genre_vec = tf.keras.layers.Flatten()(genre_embedding_layer(genre_ids))
+    genre_embeddings.append(genre_vec)
+
+movie_embedding = tf.keras.layers.Flatten()(tf.keras.layers.Embedding(1001, 10)(inputs['movieId']))
+user_embedding = tf.keras.layers.Flatten()(tf.keras.layers.Embedding(30001, 10)(inputs['userId']))
+
+all_feature_tensors = [inputs[name] for name in NUMERIC_FEATURES] + genre_embeddings + [movie_embedding, user_embedding]
+concat_features = tf.keras.layers.Concatenate()(all_feature_tensors)
+
+x = tf.keras.layers.Dense(128, activation='relu')(concat_features)
+x = tf.keras.layers.Dense(128, activation='relu')(x)
+output = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+
+model = tf.keras.Model(inputs=inputs, outputs=output)
 
 # compile the model, set loss function, optimizer and evaluation metrics
 model.compile(
