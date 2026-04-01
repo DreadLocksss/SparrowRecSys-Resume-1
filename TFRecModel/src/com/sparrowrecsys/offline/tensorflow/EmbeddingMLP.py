@@ -71,8 +71,8 @@ numerical_columns = [tf.feature_column.numeric_column('releaseYear'),
 # embedding + MLP model architecture
 model = tf.keras.Sequential([
     tf.keras.layers.DenseFeatures(numerical_columns + categorical_columns),
-    tf.keras.layers.Dense(128, activation='relu'),
-    tf.keras.layers.Dense(128, activation='relu'),
+    tf.keras.layers.Dense(256, activation='relu'),
+    tf.keras.layers.Dense(256, activation='relu'),
     tf.keras.layers.Dense(1, activation='sigmoid'),
 ])
 
