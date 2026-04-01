@@ -149,6 +149,8 @@ public class SimilarMovieProcess {
                 sameGenreCount++;
             }
         }
+
+        // 这里写错了？应该是乘以 2？
         double genreSimilarity = (double)sameGenreCount / (movie.getGenres().size() + candidate.getGenres().size()) / 2;
         double ratingScore = candidate.getAverageRating() / 5;
 

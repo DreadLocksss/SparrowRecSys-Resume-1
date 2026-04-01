@@ -7,7 +7,7 @@ import java.io.File;
 import java.util.*;
 
 /**
- * DataManager is an utility class, takes charge of all data loading logic.
+ * DataManager is a utility class, takes charge of all data loading logic.
  */
 
 public class DataManager {

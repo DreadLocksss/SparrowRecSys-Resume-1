@@ -18,6 +18,11 @@ object FeatureEngForRecModel {
   val redisEndpoint = "localhost"
   val redisPort = 6379
 
+  /**
+   * 把原始评分样本转成二分类训练标签，同时打印一些数据分布用于检查
+   * @param ratingSamples 来自于 rating.csv 的原始评分样本
+   * @return
+   */
   def addSampleLabel(ratingSamples:DataFrame): DataFrame ={
     ratingSamples.show(10, truncate = false)
     ratingSamples.printSchema()
@@ -28,6 +33,12 @@ object FeatureEngForRecModel {
     ratingSamples.withColumn("label", when(col("rating") >= 3.5, 1).otherwise(0))
   }
 
+  /**
+   * 添加电影特征
+   * @param movieSamples 电影元数据
+   * @param ratingSamples 评分元数据
+   * @return 电影特征
+   */
   def addMovieFeatures(movieSamples:DataFrame, ratingSamples:DataFrame): DataFrame ={
 
     //add movie basic features
@@ -71,6 +82,9 @@ object FeatureEngForRecModel {
     samplesWithMovies4
   }
 
+  /**
+   * 统计每个用户看过的每一种类型的电影的数量
+   */
   val extractGenres: UserDefinedFunction = udf { (genreArray: Seq[String]) => {
     val genreMap = mutable.Map[String, Int]()
     genreArray.foreach((element:String) => {
@@ -79,10 +93,17 @@ object FeatureEngForRecModel {
         genreMap(oneGenre) = genreMap.getOrElse[Int](oneGenre, 0)  + 1
       })
     })
+
+    // 按照第二个元素（统计的某个类型对应的电影数）的值进行降序排序，得到一个新的 ListMap
     val sortedGenres = ListMap(genreMap.toSeq.sortWith(_._2 > _._2):_*)
     sortedGenres.keys.toSeq
   }}
 
+  /**
+   * 添加用户特征，注意不引入未来信息，只取之前 100 条
+   * @param ratingSamples 电影特征
+   * @return 用户特征
+   */
   def addUserFeatures(ratingSamples:DataFrame): DataFrame ={
     val samplesWithUserFeatures = ratingSamples
       .withColumn("userPositiveHistory", collect_list(when(col("label") === 1, col("movieId")).otherwise(lit(null)))
