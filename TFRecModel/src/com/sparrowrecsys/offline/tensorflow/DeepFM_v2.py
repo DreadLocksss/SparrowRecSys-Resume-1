@@ -1,177 +1,360 @@
+"""
+DeepFM_v2（TensorFlow/Keras 新版兼容实现）
+
+与原始 DeepFM_v2 保持一致的核心语义：
+1. 一阶部分：类别特征与数值特征分开建模后再相加。
+2. 二阶部分：使用“全交叉”FM 形式处理类别 embedding 与数值映射向量。
+3. 深度部分：在二阶拼接特征上接 MLP。
+"""
+
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
 import tensorflow as tf
 
-"""
-Diff with DeepFM:
-    1. separate categorical features from dense features when processing first order features and second order features
-    2. modify original fm part with a fully crossed fm part
-"""
+# =========================
+# 基础配置
+# =========================
+BATCH_SIZE = 12
+EPOCHS = 5
+RANDOM_SEED = 2026
 
+MOVIE_ID_VOCAB_SIZE = 1001
+USER_ID_VOCAB_SIZE = 30001
+EMBEDDING_SIZE = 10
+FM_LATENT_DIM = 64
 
-# Training samples path, change to your local path
-training_samples_file_path = tf.keras.utils.get_file("trainingSamples.csv",
-                                                     "file:///Users/zhewang/Workspace/SparrowRecSys/src/main"
-                                                     "/resources/webroot/sampledata/trainingSamples.csv")
-# Test samples path, change to your local path
-test_samples_file_path = tf.keras.utils.get_file("testSamples.csv",
-                                                 "file:///Users/zhewang/Workspace/SparrowRecSys/src/main"
-                                                 "/resources/webroot/sampledata/testSamples.csv")
+GENRE_VOCAB = [
+    "Film-Noir",
+    "Action",
+    "Adventure",
+    "Horror",
+    "Romance",
+    "War",
+    "Comedy",
+    "Western",
+    "Documentary",
+    "Sci-Fi",
+    "Drama",
+    "Thriller",
+    "Crime",
+    "Fantasy",
+    "Animation",
+    "IMAX",
+    "Mystery",
+    "Children",
+    "Musical",
+]
 
-
-# load sample as tf dataset
-def get_dataset(file_path):
-    dataset = tf.data.experimental.make_csv_dataset(
-        file_path,
-        batch_size=12,
-        label_name='label',
-        na_value="0",
-        num_epochs=1,
-        ignore_errors=True)
-    return dataset
-
-
-# split as test dataset and training dataset
-train_dataset = get_dataset(training_samples_file_path)
-test_dataset = get_dataset(test_samples_file_path)
-
-# define input for keras model
-inputs = {
-    'movieAvgRating': tf.keras.layers.Input(name='movieAvgRating', shape=(), dtype='float32'),
-    'movieRatingStddev': tf.keras.layers.Input(name='movieRatingStddev', shape=(), dtype='float32'),
-    'movieRatingCount': tf.keras.layers.Input(name='movieRatingCount', shape=(), dtype='int32'),
-    'userAvgRating': tf.keras.layers.Input(name='userAvgRating', shape=(), dtype='float32'),
-    'userRatingStddev': tf.keras.layers.Input(name='userRatingStddev', shape=(), dtype='float32'),
-    'userRatingCount': tf.keras.layers.Input(name='userRatingCount', shape=(), dtype='int32'),
-    'releaseYear': tf.keras.layers.Input(name='releaseYear', shape=(), dtype='int32'),
-
-    'movieId': tf.keras.layers.Input(name='movieId', shape=(), dtype='int32'),
-    'userId': tf.keras.layers.Input(name='userId', shape=(), dtype='int32'),
-    'userRatedMovie1': tf.keras.layers.Input(name='userRatedMovie1', shape=(), dtype='int32'),
-
-    'userGenre1': tf.keras.layers.Input(name='userGenre1', shape=(), dtype='string'),
-    'userGenre2': tf.keras.layers.Input(name='userGenre2', shape=(), dtype='string'),
-    'userGenre3': tf.keras.layers.Input(name='userGenre3', shape=(), dtype='string'),
-    'userGenre4': tf.keras.layers.Input(name='userGenre4', shape=(), dtype='string'),
-    'userGenre5': tf.keras.layers.Input(name='userGenre5', shape=(), dtype='string'),
-    'movieGenre1': tf.keras.layers.Input(name='movieGenre1', shape=(), dtype='string'),
-    'movieGenre2': tf.keras.layers.Input(name='movieGenre2', shape=(), dtype='string'),
-    'movieGenre3': tf.keras.layers.Input(name='movieGenre3', shape=(), dtype='string'),
+MODEL_INPUT_DTYPES = {
+    "movieAvgRating": tf.float32,
+    "movieRatingStddev": tf.float32,
+    "movieRatingCount": tf.int32,
+    "userAvgRating": tf.float32,
+    "userRatingStddev": tf.float32,
+    "userRatingCount": tf.int32,
+    "releaseYear": tf.int32,
+    "movieId": tf.int32,
+    "userId": tf.int32,
+    "userGenre1": tf.string,
+    "movieGenre1": tf.string,
 }
 
-# movie id embedding feature
-movie_col = tf.feature_column.categorical_column_with_identity(key='movieId', num_buckets=1001)
-movie_emb_col = tf.feature_column.embedding_column(movie_col, 10)
-movie_ind_col = tf.feature_column.indicator_column(movie_col)  # movid id indicator columns
+FLOAT_COLUMNS = [
+    "movieAvgRating",
+    "movieRatingStddev",
+    "userAvgRating",
+    "userRatingStddev",
+]
 
-# user id embedding feature
-user_col = tf.feature_column.categorical_column_with_identity(key='userId', num_buckets=30001)
-user_emb_col = tf.feature_column.embedding_column(user_col, 10)
-user_ind_col = tf.feature_column.indicator_column(user_col)  # user id indicator columns
+INT_COLUMNS = [
+    "movieRatingCount",
+    "userRatingCount",
+    "releaseYear",
+    "movieId",
+    "userId",
+    "label",
+]
 
-# genre features vocabulary
-genre_vocab = ['Film-Noir', 'Action', 'Adventure', 'Horror', 'Romance', 'War', 'Comedy', 'Western', 'Documentary',
-               'Sci-Fi', 'Drama', 'Thriller',
-               'Crime', 'Fantasy', 'Animation', 'IMAX', 'Mystery', 'Children', 'Musical']
+STRING_COLUMNS = ["userGenre1", "movieGenre1"]
 
-# user genre embedding feature
-user_genre_col = tf.feature_column.categorical_column_with_vocabulary_list(key="userGenre1",
-                                                                           vocabulary_list=genre_vocab)
-user_genre_ind_col = tf.feature_column.indicator_column(user_genre_col)
-user_genre_emb_col = tf.feature_column.embedding_column(user_genre_col, 10)
+DEEP_NUMERIC_COLUMNS = [
+    "releaseYear",
+    "movieRatingCount",
+    "movieAvgRating",
+    "movieRatingStddev",
+    "userRatingCount",
+    "userAvgRating",
+    "userRatingStddev",
+]
 
-# item genre embedding feature
-item_genre_col = tf.feature_column.categorical_column_with_vocabulary_list(key="movieGenre1",
-                                                                           vocabulary_list=genre_vocab)
-item_genre_ind_col = tf.feature_column.indicator_column(item_genre_col)
-item_genre_emb_col = tf.feature_column.embedding_column(item_genre_col, 10)
 
-# fm first-order categorical items
-cat_columns = [movie_ind_col, user_ind_col, user_genre_ind_col, item_genre_ind_col]
+def _resolve_sample_path(file_name: str) -> Path:
+    """自动定位项目内 sampledata 文件，避免硬编码本地绝对路径。"""
+    relative_candidates = [
+        Path("src/main/resources/webroot/sampledata") / file_name,
+        Path("target/classes/webroot/sampledata") / file_name,
+    ]
+    script_path = Path(__file__).resolve()
+    search_roots = [Path.cwd(), script_path.parent, *script_path.parents]
 
-deep_columns = [tf.feature_column.numeric_column('releaseYear'),
-                tf.feature_column.numeric_column('movieRatingCount'),
-                tf.feature_column.numeric_column('movieAvgRating'),
-                tf.feature_column.numeric_column('movieRatingStddev'),
-                tf.feature_column.numeric_column('userRatingCount'),
-                tf.feature_column.numeric_column('userAvgRating'),
-                tf.feature_column.numeric_column('userRatingStddev')]
+    for root in search_roots:
+        for relative_path in relative_candidates:
+            candidate = (root / relative_path).resolve()
+            if candidate.exists():
+                return candidate
 
-first_order_cat_feature = tf.keras.layers.DenseFeatures(cat_columns)(inputs)
-first_order_cat_feature = tf.keras.layers.Dense(1, activation=None)(first_order_cat_feature)
-first_order_deep_feature = tf.keras.layers.DenseFeatures(deep_columns)(inputs)
-first_order_deep_feature = tf.keras.layers.Dense(1, activation=None)(first_order_deep_feature)
-## first order feature
+    raise FileNotFoundError(f"未找到样本文件: {file_name}")
 
-first_order_feature = tf.keras.layers.Add()([first_order_cat_feature, first_order_deep_feature])
 
-second_order_cat_columns_emb = [tf.keras.layers.DenseFeatures([item_genre_emb_col])(inputs),
-                                tf.keras.layers.DenseFeatures([movie_emb_col])(inputs),
-                                tf.keras.layers.DenseFeatures([user_genre_emb_col])(inputs),
-                                tf.keras.layers.DenseFeatures([user_emb_col])(inputs)
-                                ]
+def _prepare_dataframe(csv_path: Path) -> pd.DataFrame:
+    """读取并完成类型规范化，只保留本模型所需字段。"""
+    frame = pd.read_csv(csv_path).fillna(0)
 
-second_order_cat_columns = []
-for feature_emb in second_order_cat_columns_emb:
-    feature = tf.keras.layers.Dense(64, activation=None)(feature_emb)
-    feature = tf.keras.layers.Reshape((-1, 64))(feature)
-    second_order_cat_columns.append(feature)
+    for column in FLOAT_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0).astype(np.float32)
+    for column in INT_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0).astype(np.int32)
+    for column in STRING_COLUMNS:
+        frame[column] = frame[column].astype(str)
 
-second_order_deep_columns = tf.keras.layers.DenseFeatures(deep_columns)(inputs)
-second_order_deep_columns = tf.keras.layers.Dense(64, activation=None)(second_order_deep_columns)
-second_order_deep_columns = tf.keras.layers.Reshape((-1, 64))(second_order_deep_columns)
-second_order_fm_feature = tf.keras.layers.Concatenate(axis=1)(second_order_cat_columns + [second_order_deep_columns])
+    selected_columns = list(MODEL_INPUT_DTYPES.keys()) + ["label"]
+    return frame[selected_columns]
 
-## second_order_deep_feature
-deep_feature = tf.keras.layers.Flatten()(second_order_fm_feature)
-deep_feature = tf.keras.layers.Dense(32, activation='relu')(deep_feature)
-deep_feature = tf.keras.layers.Dense(16, activation='relu')(deep_feature)
+
+def build_dataset(csv_path: Path, batch_size: int, shuffle: bool, seed: int) -> tf.data.Dataset:
+    """构建 tf.data.Dataset，输出格式为 (features, label)。"""
+    frame = _prepare_dataframe(csv_path)
+    features = {name: frame[name].to_numpy() for name in MODEL_INPUT_DTYPES}
+    labels = frame["label"].to_numpy(dtype=np.float32)
+
+    dataset = tf.data.Dataset.from_tensor_slices((features, labels))
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=len(frame), seed=seed, reshuffle_each_iteration=True)
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def _create_inputs() -> Dict[str, tf.keras.layers.Input]:
+    """创建 Keras Functional 输入。"""
+    return {
+        name: tf.keras.layers.Input(name=name, shape=(), dtype=dtype)
+        for name, dtype in MODEL_INPUT_DTYPES.items()
+    }
+
+
+def _expand_and_cast(input_tensor: tf.Tensor, dtype: tf.dtypes.DType, name: str) -> tf.Tensor:
+    """将标量特征扩展成 [batch, 1] 并转成指定类型。"""
+    return tf.keras.layers.Lambda(
+        lambda x: tf.cast(tf.expand_dims(x, axis=-1), dtype=dtype),
+        name=name,
+    )(input_tensor)
 
 
 class ReduceLayer(tf.keras.layers.Layer):
-    def __init__(self, axis, op='sum', **kwargs):
-        super().__init__()
+    """对指定轴做 reduce 操作，兼容原始实现语义。"""
+
+    def __init__(self, axis: int, op: str = "sum", **kwargs):
+        super().__init__(**kwargs)
         self.axis = axis
         self.op = op
-        assert self.op in ['sum', 'mean']
+        if self.op not in ("sum", "mean"):
+            raise ValueError("op 仅支持 'sum' 或 'mean'")
 
-    def build(self, input_shape):
-        pass
-
-    def call(self, input, **kwargs):
-        if self.op == 'sum':
-            return tf.reduce_sum(input, axis=self.axis)
-        elif self.op == 'mean':
-            return tf.reduce_mean(input, axis=self.axis)
-        return tf.reduce_sum(input, axis=self.axis)
+    def call(self, inputs: tf.Tensor, **kwargs) -> tf.Tensor:
+        if self.op == "sum":
+            return tf.reduce_sum(inputs, axis=self.axis)
+        return tf.reduce_mean(inputs, axis=self.axis)
 
 
-second_order_sum_feature = ReduceLayer(1)(second_order_fm_feature)
-second_order_sum_square_feature = tf.keras.layers.multiply([second_order_sum_feature, second_order_sum_feature])
-second_order_square_feature = tf.keras.layers.multiply([second_order_fm_feature, second_order_fm_feature])
-second_order_square_sum_feature = ReduceLayer(1)(second_order_square_feature)
-## second_order_fm_feature
-second_order_fm_feature = tf.keras.layers.subtract([second_order_sum_square_feature, second_order_square_sum_feature])
+def build_deepfm_v2_model() -> tf.keras.Model:
+    """构建 DeepFM_v2 模型。"""
+    inputs = _create_inputs()
 
-concatenated_outputs = tf.keras.layers.Concatenate(axis=1)([first_order_feature, second_order_fm_feature, deep_feature])
-output_layer = tf.keras.layers.Dense(1, activation='sigmoid')(concatenated_outputs)
+    # 数值特征（Deep 与 FM 一致使用同一组输入）
+    deep_numeric_tensors = [
+        _expand_and_cast(inputs[column_name], tf.float32, f"{column_name}_expand")
+        for column_name in DEEP_NUMERIC_COLUMNS
+    ]
+    deep_numeric_feature = tf.keras.layers.Concatenate(name="deep_numeric_concat")(deep_numeric_tensors)
 
-model = tf.keras.Model(inputs, output_layer)
-# compile the model, set loss function, optimizer and evaluation metrics
-model.compile(
-    loss='binary_crossentropy',
-    optimizer='adam',
-    metrics=['accuracy', tf.keras.metrics.AUC(curve='ROC'), tf.keras.metrics.AUC(curve='PR')])
+    # 类别特征编码（对应原代码中的 indicator column）
+    genre_lookup = tf.keras.layers.StringLookup(
+        vocabulary=GENRE_VOCAB,
+        mask_token=None,
+        num_oov_indices=1,
+        name="genre_lookup",
+    )
+    genre_token_size = len(GENRE_VOCAB) + 1
+    one_hot_encoder_genre = tf.keras.layers.CategoryEncoding(
+        num_tokens=genre_token_size,
+        output_mode="one_hot",
+        name="genre_one_hot",
+    )
+    one_hot_encoder_movie = tf.keras.layers.CategoryEncoding(
+        num_tokens=MOVIE_ID_VOCAB_SIZE,
+        output_mode="one_hot",
+        name="movie_one_hot",
+    )
+    one_hot_encoder_user = tf.keras.layers.CategoryEncoding(
+        num_tokens=USER_ID_VOCAB_SIZE,
+        output_mode="one_hot",
+        name="user_one_hot",
+    )
 
-# train the model
-model.fit(train_dataset, epochs=5)
+    movie_one_hot = one_hot_encoder_movie(inputs["movieId"])
+    user_one_hot = one_hot_encoder_user(inputs["userId"])
+    user_genre_ids = genre_lookup(inputs["userGenre1"])
+    movie_genre_ids = genre_lookup(inputs["movieGenre1"])
+    user_genre_one_hot = one_hot_encoder_genre(user_genre_ids)
+    movie_genre_one_hot = one_hot_encoder_genre(movie_genre_ids)
 
-# evaluate the model
-test_loss, test_accuracy, test_roc_auc, test_pr_auc = model.evaluate(test_dataset)
-print('\n\nTest Loss {}, Test Accuracy {}, Test ROC AUC {}, Test PR AUC {}'.format(test_loss, test_accuracy,
-                                                                                   test_roc_auc, test_pr_auc))
+    first_order_cat_feature = tf.keras.layers.Concatenate(name="first_order_cat_concat")(
+        [movie_one_hot, user_one_hot, user_genre_one_hot, movie_genre_one_hot]
+    )
+    first_order_cat_feature = tf.keras.layers.Dense(1, activation=None, name="first_order_cat_dense")(
+        first_order_cat_feature
+    )
+    first_order_deep_feature = tf.keras.layers.Dense(1, activation=None, name="first_order_deep_dense")(
+        deep_numeric_feature
+    )
+    first_order_feature = tf.keras.layers.Add(name="first_order_add")(
+        [first_order_cat_feature, first_order_deep_feature]
+    )
 
-# print some predict results
-predictions = model.predict(test_dataset)
-for prediction, goodRating in zip(predictions[:12], list(test_dataset)[0][1][:12]):
-    print("Predicted good rating: {:.2%}".format(prediction[0]),
-          " | Actual rating label: ",
-          ("Good Rating" if bool(goodRating) else "Bad Rating"))
+    # 二阶类别 embedding（与原始语义一致：movie/user/genre 先 embedding，再映射到 64 维）
+    movie_embedding = tf.keras.layers.Embedding(
+        input_dim=MOVIE_ID_VOCAB_SIZE,
+        output_dim=EMBEDDING_SIZE,
+        name="movie_embedding",
+    )
+    user_embedding = tf.keras.layers.Embedding(
+        input_dim=USER_ID_VOCAB_SIZE,
+        output_dim=EMBEDDING_SIZE,
+        name="user_embedding",
+    )
+    genre_embedding = tf.keras.layers.Embedding(
+        input_dim=genre_token_size,
+        output_dim=EMBEDDING_SIZE,
+        name="genre_embedding",
+    )
+
+    movie_emb = movie_embedding(tf.keras.layers.Lambda(lambda x: tf.expand_dims(x, axis=-1))(inputs["movieId"]))
+    movie_emb = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=1), name="movie_emb_squeeze")(movie_emb)
+
+    user_emb = user_embedding(tf.keras.layers.Lambda(lambda x: tf.expand_dims(x, axis=-1))(inputs["userId"]))
+    user_emb = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=1), name="user_emb_squeeze")(user_emb)
+
+    user_genre_emb = genre_embedding(user_genre_ids)
+    movie_genre_emb = genre_embedding(movie_genre_ids)
+
+    second_order_cat_embs: List[tf.Tensor] = [movie_genre_emb, movie_emb, user_genre_emb, user_emb]
+    second_order_cat_columns: List[tf.Tensor] = []
+    for index, feature_emb in enumerate(second_order_cat_embs):
+        feature = tf.keras.layers.Dense(FM_LATENT_DIM, activation=None, name=f"second_cat_dense_{index}")(
+            feature_emb
+        )
+        feature = tf.keras.layers.Reshape((1, FM_LATENT_DIM), name=f"second_cat_reshape_{index}")(feature)
+        second_order_cat_columns.append(feature)
+
+    second_order_deep_columns = tf.keras.layers.Dense(
+        FM_LATENT_DIM, activation=None, name="second_deep_dense"
+    )(deep_numeric_feature)
+    second_order_deep_columns = tf.keras.layers.Reshape(
+        (1, FM_LATENT_DIM), name="second_deep_reshape"
+    )(second_order_deep_columns)
+
+    second_order_all_features = tf.keras.layers.Concatenate(axis=1, name="second_order_feature_concat")(
+        second_order_cat_columns + [second_order_deep_columns]
+    )
+
+    # 深度分支（原始结构：Flatten -> 32 -> 16）
+    deep_feature = tf.keras.layers.Flatten(name="deep_flatten")(second_order_all_features)
+    deep_feature = tf.keras.layers.Dense(32, activation="relu", name="deep_dense_32")(deep_feature)
+    deep_feature = tf.keras.layers.Dense(16, activation="relu", name="deep_dense_16")(deep_feature)
+
+    # FM 二阶交叉项（保持与原代码一致：sum^2 - square_sum）
+    second_order_sum_feature = ReduceLayer(axis=1, op="sum", name="second_sum")(second_order_all_features)
+    second_order_sum_square_feature = tf.keras.layers.Multiply(name="second_sum_square")(
+        [second_order_sum_feature, second_order_sum_feature]
+    )
+    second_order_square_feature = tf.keras.layers.Multiply(name="second_square")(
+        [second_order_all_features, second_order_all_features]
+    )
+    second_order_square_sum_feature = ReduceLayer(axis=1, op="sum", name="second_square_sum")(
+        second_order_square_feature
+    )
+    second_order_fm_feature = tf.keras.layers.Subtract(name="second_fm_subtract")(
+        [second_order_sum_square_feature, second_order_square_sum_feature]
+    )
+
+    concatenated_outputs = tf.keras.layers.Concatenate(axis=1, name="final_concat")(
+        [first_order_feature, second_order_fm_feature, deep_feature]
+    )
+    output_layer = tf.keras.layers.Dense(1, activation="sigmoid", name="prediction")(concatenated_outputs)
+
+    model = tf.keras.Model(inputs=inputs, outputs=output_layer, name="deepfm_v2_model")
+    model.compile(
+        loss="binary_crossentropy",
+        optimizer="adam",
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(curve="ROC", name="roc_auc"),
+            tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
+        ],
+    )
+    return model
+
+
+def _collect_labels(dataset: tf.data.Dataset) -> np.ndarray:
+    """从 dataset 按顺序提取 label，便于打印预测示例。"""
+    labels = []
+    for _, batch_labels in dataset:
+        labels.append(tf.cast(batch_labels, tf.float32))
+    return tf.concat(labels, axis=0).numpy().reshape(-1)
+
+
+def run() -> None:
+    """训练、评估并打印预测样例。"""
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
+
+    training_samples_file_path = _resolve_sample_path("trainingSamples.csv")
+    test_samples_file_path = _resolve_sample_path("testSamples.csv")
+
+    train_dataset = build_dataset(
+        training_samples_file_path,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        seed=RANDOM_SEED,
+    )
+    test_dataset = build_dataset(
+        test_samples_file_path,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        seed=RANDOM_SEED,
+    )
+
+    model = build_deepfm_v2_model()
+    model.fit(train_dataset, epochs=EPOCHS, verbose=2)
+
+    test_loss, test_accuracy, test_roc_auc, test_pr_auc = model.evaluate(test_dataset, verbose=2)
+    print(
+        "\n\nTest Loss {:.6f}, Test Accuracy {:.6f}, Test ROC AUC {:.6f}, Test PR AUC {:.6f}".format(
+            float(test_loss), float(test_accuracy), float(test_roc_auc), float(test_pr_auc)
+        )
+    )
+
+    predictions = model.predict(test_dataset, verbose=0).reshape(-1)
+    labels = _collect_labels(test_dataset)
+
+    for prediction, good_rating in zip(predictions[:12], labels[:12]):
+        print(
+            "Predicted good rating: {:.2%} | Actual rating label: {}".format(
+                prediction, "Good Rating" if bool(good_rating) else "Bad Rating"
+            )
+        )
+
+
+if __name__ == "__main__":
+    run()
